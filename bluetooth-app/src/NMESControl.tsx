@@ -10,7 +10,9 @@ const NMESControlPanel: React.FC = () => {
     imuData,
     startIMU,
     stopIMU,
-    initializeDevice
+    initializeDevice,
+    sendCommand,
+    stopStimulation
   } = useBluetooth()
 
   const [sensor1Data, setSensor1Data] = useState<{ time: number; sensorValue: number }[]>([])
@@ -18,6 +20,14 @@ const NMESControlPanel: React.FC = () => {
 
   const [isMeasuring, setIsMeasuring] = useState(false)
   const [isInitializing, setIsInitializing] = useState(false)
+
+  // Stimulation control state
+  const [electrodeA, setElectrodeA] = useState<number>(1)
+  const [electrodeB, setElectrodeB] = useState<number>(2)
+  const [current, setCurrent] = useState<number>(20)
+  const [isStimulating, setIsStimulating] = useState<boolean>(false)
+  const [lastPair, setLastPair] = useState<[number, number] | null>(null)
+  const [lastCurrent, setLastCurrent] = useState<number | null>(null)
 
   // Optimization-related state removed
 
@@ -71,6 +81,36 @@ const NMESControlPanel: React.FC = () => {
     stopIMU()
   }
 
+  const handleStimulate = async () => {
+    if (electrodeA === electrodeB) {
+      console.warn('Select two different electrodes')
+      return
+    }
+
+    try {
+      setIsStimulating(true)
+      setLastPair([electrodeA, electrodeB])
+      setLastCurrent(current)
+      // Send stimulation command: 'e' followed by current and electrode numbers (matches provider implementation)
+      await sendCommand('e', current, electrodeA, electrodeB, 1, 0)
+      console.log('✅ Stimulation command sent')
+    } catch (error) {
+      console.error('❌ Failed to send stimulation command', error)
+      setIsStimulating(false)
+    }
+  }
+
+  const handleStopStimulate = async () => {
+    try {
+      await stopStimulation()
+      console.log('🔴 Stop stimulation sent')
+    } catch (error) {
+      console.error('❌ Failed to stop stimulation', error)
+    } finally {
+      setIsStimulating(false)
+    }
+  }
+
   return (
     <div className={styles.container}>
       <div className={styles.header}>
@@ -85,10 +125,46 @@ const NMESControlPanel: React.FC = () => {
 
         {isConnected && (
           <div className={styles.controlBox}>
-            <h2>Search Algorithm & Sensor Control</h2>
+            <h2>Stimulation & Sensor Control</h2>
 
             <div className={styles.inputGroup}>
-              {/* Optimization inputs removed */}
+              <label>
+                Electrode A:
+                <select
+                  value={String(electrodeA)}
+                  onChange={(e) => setElectrodeA(Number(e.target.value))}
+                  className={styles.select}
+                >
+                  {[1,2,3,4,5,6].map((n) => (
+                    <option key={n} value={n}>{n}</option>
+                  ))}
+                </select>
+              </label>
+
+              <label>
+                Electrode B:
+                <select
+                  value={String(electrodeB)}
+                  onChange={(e) => setElectrodeB(Number(e.target.value))}
+                  className={styles.select}
+                >
+                  {[1,2,3,4,5,6].map((n) => (
+                    <option key={n} value={n}>{n}</option>
+                  ))}
+                </select>
+              </label>
+
+              <label>
+                Current (mA):
+                <input
+                  type="number"
+                  min={0}
+                  max={100}
+                  value={current}
+                  onChange={(e) => setCurrent(Number(e.target.value))}
+                  className={styles.input}
+                />
+              </label>
             </div>
 
             <div className={styles.buttonContainer} style={{ marginTop: '15px' }}>
@@ -101,15 +177,28 @@ const NMESControlPanel: React.FC = () => {
               </button>
             </div>
 
-            {/* Optimization controls removed */}
-
             <div className={styles.buttonContainer}>
-              <button className={styles.button} onClick={handleStartIMU} disabled={!isConnected || isMeasuring}>
-                Start Sensor(s)
+              <button
+                className={styles.button}
+                onClick={handleStimulate}
+                disabled={!isConnected || isStimulating || electrodeA === electrodeB}
+              >
+                Stimulate Pair
               </button>
-              <button className={styles.button} onClick={handleStopIMU} disabled={!isConnected || !isMeasuring}>
-                Stop Sensor(s)
+              <button
+                className={styles.button}
+                onClick={handleStopStimulate}
+                disabled={!isConnected || !isStimulating}
+              >
+                Stop Stimulation
               </button>
+            </div>
+
+            <div style={{ marginTop: 10 }}>
+              <strong>Last stimulation:</strong>
+              <div>Pair: {lastPair ? `${lastPair[0]} - ${lastPair[1]}` : '—'}</div>
+              <div>Current: {lastCurrent ?? '—'} mA</div>
+              <div>Status: {isStimulating ? 'Stimulating' : 'Idle'}</div>
             </div>
           </div>
         )}
