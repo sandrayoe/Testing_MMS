@@ -74,7 +74,7 @@ const NMESControlPanel: React.FC = () => {
   return (
     <div className={styles.container}>
       <div className={styles.header}>
-        <img src="/mms_logo_2.png" alt="App Logo" className={styles.logo} />
+        <img src="/mms_logo_2.png" className={styles.logo} />
   <h1 className={styles.heading}>MMS - NMES Control (Frontend Demo)</h1>
       </div>
 
