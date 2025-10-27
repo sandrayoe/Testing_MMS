@@ -53,7 +53,7 @@ export const BluetoothProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         rawServerRef.current = server
       }
 
-      setDevice({ id: device.id, name: device.name ?? 'MMS NUS' })
+      setDevice({ id: device.id, name: device.name ?? 'MMS nus' })
       setIsConnected(true)
 
       // Listen for unexpected disconnects and update state
