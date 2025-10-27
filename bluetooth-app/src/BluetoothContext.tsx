@@ -23,18 +23,72 @@ export const BluetoothProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
   const imuRef = useRef({ imu1_changes: [] as number[], imu2_changes: [] as number[] })
   const imuIntervalRef = useRef<number | null>(null)
+  // Raw Web Bluetooth device/server refs (not exposed in context)
+  // Use `any` here to avoid depending on lib typings in environments where web-bluetooth types
+  // may not be available in the TypeScript lib configuration.
+  const rawDeviceRef = useRef<any>(null)
+  const rawServerRef = useRef<any>(null)
 
   const connect = async () => {
-    // simulate discovery / connect
-    await new Promise((r) => setTimeout(r, 300))
-    setDevice({ id: 'mock-1', name: 'Mock NMES Device' })
-    setIsConnected(true)
+    // Use Web Bluetooth API to find and connect to devices named 'MMS nus'
+    if (!navigator.bluetooth) {
+      console.error('Web Bluetooth API is not available in this browser.')
+      throw new Error('Web Bluetooth API not available')
+    }
+
+    try {
+      // Prefer explicit name filter so the chooser only shows matching devices
+      const device = await navigator.bluetooth.requestDevice({
+        filters: [{ name: 'MMS nus' }],
+        // include the Nordic UART Service (NUS) UUID 
+        optionalServices: ['6e400001-b5a3-f393-e0a9-e50e24dcca9e']
+      })
+
+      // Save raw device for disconnect handling
+      rawDeviceRef.current = device
+
+      // Connect to GATT server if available
+      if (device.gatt) {
+        const server = await device.gatt.connect()
+        rawServerRef.current = server
+      }
+
+      setDevice({ id: device.id, name: device.name ?? 'MMS NUS' })
+      setIsConnected(true)
+
+      // Listen for unexpected disconnects and update state
+      device.addEventListener?.('gattserverdisconnected', () => {
+        console.log('Bluetooth device disconnected')
+        stopIMU()
+        setIsConnected(false)
+        setDevice(null)
+        rawDeviceRef.current = null
+        rawServerRef.current = null
+      })
+    } catch (err) {
+      // user cancelled chooser or other error
+      console.error('Bluetooth connect failed:', err)
+      throw err
+    }
   }
 
   const disconnect = () => {
     stopIMU()
+    // If a device is connected via GATT, disconnect it cleanly
+    try {
+      if (rawServerRef.current && rawServerRef.current.connected) {
+        rawServerRef.current.disconnect()
+      } else if (rawDeviceRef.current && rawDeviceRef.current.gatt?.connected) {
+        rawDeviceRef.current.gatt.disconnect()
+      }
+    } catch (e) {
+      console.warn('Error during Bluetooth disconnect', e)
+    }
+
     setIsConnected(false)
     setDevice(null)
+    rawDeviceRef.current = null
+    rawServerRef.current = null
   }
 
   const startIMU = () => {
