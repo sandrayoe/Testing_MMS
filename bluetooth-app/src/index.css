@@ -1,0 +1,6 @@
+:root { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial; }
+body { margin: 0; padding: 0; background: #f7f7fb; color: #222; }
+.app { padding: 20px; max-width: 980px; margin: 0 auto; }
+.panel { background: #fff; border-radius: 8px; padding: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); margin-bottom: 12px }
+.row { display:flex; gap:12px; align-items:center }
+.spacer { flex:1 }
