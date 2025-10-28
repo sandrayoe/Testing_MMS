@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react'
 import { useBluetooth } from './BluetoothContext'
 import BluetoothControl from './BluetoothControl'
 import styles from './NMESControlPanel.module.css'
-import { LineChart, Line, CartesianGrid, XAxis, YAxis, Tooltip, Legend } from 'recharts'
+import { LineChart, Line, CartesianGrid, XAxis, YAxis, Tooltip, Legend, ResponsiveContainer } from 'recharts'
 
 const NMESControlPanel: React.FC = () => {
   const {
@@ -206,40 +206,37 @@ const NMESControlPanel: React.FC = () => {
 
       {isConnected && (
         <div className={styles.contentContainer}>
-          <div className={styles.leftPanel}>
-            <div className={styles.electrodeBox}>
-              <h2>Device Status</h2>
-              <p>Simple sensor dashboard and device controls (optimization features removed).</p>
-              <div>
-                <span>Sensor samples: </span>
-                <span className="valueBox">{sensor1Data.length + sensor2Data.length}</span>
-              </div>
-            </div>
-          </div>
-
           <div className={styles.rightPanel}>
             <div className={styles.chartContainer}>
               <h3>Sensor 1 Readings </h3>
-              <LineChart width={600} height={200} data={sensor1Data}>
-                <CartesianGrid strokeDasharray="3 3" />
-                <XAxis dataKey="time" />
-                <YAxis domain={[0, 10]} />
-                <Tooltip />
-                <Legend />
-                <Line type="monotone" dataKey="sensorValue" stroke="#8884d8" strokeWidth={2} name="Raw Sensor 1" />
-              </LineChart>
+              <div style={{ width: '100%', height: 200 }}>
+                <ResponsiveContainer width="100%" height="100%">
+                  <LineChart data={sensor1Data}>
+                    <CartesianGrid strokeDasharray="3 3" />
+                    <XAxis dataKey="time" />
+                    <YAxis domain={[0, 10]} />
+                    <Tooltip />
+                    <Legend />
+                    <Line type="monotone" dataKey="sensorValue" stroke="#8884d8" strokeWidth={2} name="Raw Sensor 1" />
+                  </LineChart>
+                </ResponsiveContainer>
+              </div>
             </div>
 
             <div className={styles.chartContainer}>
               <h3>Sensor 2 Readings </h3>
-              <LineChart width={600} height={200} data={sensor2Data}>
-                <CartesianGrid strokeDasharray="3 3" />
-                <XAxis dataKey="time" />
-                <YAxis domain={[0, 10]} />
-                <Tooltip />
-                <Legend />
-                <Line type="monotone" dataKey="sensorValue" stroke="#82ca9d" strokeWidth={2} name="Raw Sensor 2" />
-              </LineChart>
+              <div style={{ width: '100%', height: 200 }}>
+                <ResponsiveContainer width="100%" height="100%">
+                  <LineChart data={sensor2Data}>
+                    <CartesianGrid strokeDasharray="3 3" />
+                    <XAxis dataKey="time" />
+                    <YAxis domain={[0, 10]} />
+                    <Tooltip />
+                    <Legend />
+                    <Line type="monotone" dataKey="sensorValue" stroke="#82ca9d" strokeWidth={2} name="Raw Sensor 2" />
+                  </LineChart>
+                </ResponsiveContainer>
+              </div>
             </div>
           </div>
         </div>
