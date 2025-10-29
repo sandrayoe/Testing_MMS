@@ -177,6 +177,23 @@ const NMESControlPanel: React.FC = () => {
               </button>
             </div>
 
+            <div className={styles.buttonContainer} style={{ marginTop: '10px' }}>
+              <button
+                className={styles.button}
+                onClick={handleStartIMU}
+                disabled={!isConnected || isMeasuring}
+              >
+                Start Sensor
+              </button>
+              <button
+                className={styles.button}
+                onClick={handleStopIMU}
+                disabled={!isConnected || !isMeasuring}
+              >
+                Stop Sensor
+              </button>
+            </div>
+
             <div className={styles.buttonContainer}>
               <button
                 className={styles.button}
@@ -198,7 +215,7 @@ const NMESControlPanel: React.FC = () => {
               <strong>Last stimulation:</strong>
               <div>Pair: {lastPair ? `${lastPair[0]} - ${lastPair[1]}` : '—'}</div>
               <div>Current: {lastCurrent ?? '—'} mA</div>
-              <div>Status: {isStimulating ? 'Stimulating' : 'Idle'}</div>
+              {isStimulating && <div>Status: Stimulating</div>}
             </div>
           </div>
         )}
