@@ -1,5 +1,8 @@
 import React, { createContext, useState, useContext, useRef, useEffect } from "react";
 
+// Timed sample type used for timestamped IMU entries
+export type TimedSample = { value: number; ts: number };
+
 // Define the Bluetooth context and its type
 interface BluetoothContextType {
     connect: () => Promise<void>;
@@ -16,9 +19,10 @@ interface BluetoothContextType {
       maxCurrent: number
     ) => Promise<void>;
     stopOptimizationLoop: () => Promise<void>;
-    imuData: { imu1_changes: number[]; imu2_changes: number[] };
+    imuData: { imu1_changes: TimedSample[]; imu2_changes: TimedSample[] };
     startIMU: () => void;
     stopIMU: () => void;
+  clearIMU: () => void;
     isOptimizationRunning: boolean; 
     initializeDevice: () => void; 
 }
@@ -40,7 +44,9 @@ export const BluetoothProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   const isOptimizationRunningRef = useRef(false); 
   const [isOptimizationRunning, setIsOptimizationRunning] = useState(false);
 
-  const [imuData, setImuData] = useState<{ imu1_changes: number[]; imu2_changes: number[] }>(
+  // imuData stores timestamped values to preserve ordering and enable binning in the UI.
+  type TimedSample = { value: number; ts: number };
+  const [imuData, setImuData] = useState<{ imu1_changes: TimedSample[]; imu2_changes: TimedSample[] }>(
     {
       imu1_changes: [],
       imu2_changes: []
@@ -124,6 +130,7 @@ export const BluetoothProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   };
   
   const IDLE_VALUE = 2048;  // idle value for IMU
+  const SAMPLE_INTERVAL_MS = 20; // assumed per-sample spacing used to timestamp samples inside a single notification
   let pendingResolve: ((data: string) => void) | null = null;
 
   const handleCommandResponse = (message: string) => {
@@ -138,33 +145,40 @@ export const BluetoothProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   const maxHistory = 500; // max history for the IMU data
 
   const handleIMUData = (rawBytes: Uint8Array) => {
-
     try {
+      const now = performance.now();
       const dataView = new DataView(rawBytes.buffer);
-      const sensor1Changes: number[] = [];
-      const sensor2Changes: number[] = [];
+      const sensor1Changes: TimedSample[] = [];
+      const sensor2Changes: TimedSample[] = [];
 
-      for (let i = 0; i < rawBytes.length; i += 4) {
-          const sensor1Value = dataView.getUint16(i, true);
-          const sensor2Value = dataView.getUint16(i + 2, true);
+      // Count how many sample pairs are present
+      const numPairs = Math.floor(rawBytes.length / 4);
 
-          // Calculate change (delta) from idle value
-          const sensor1Delta = Math.abs(sensor1Value - IDLE_VALUE);
-          const sensor2Delta = Math.abs(sensor2Value - IDLE_VALUE);
+      for (let pairIndex = 0; pairIndex < numPairs; pairIndex++) {
+        const i = pairIndex * 4;
+        const sensor1Value = dataView.getUint16(i, true);
+        const sensor2Value = dataView.getUint16(i + 2, true);
 
-          sensor1Changes.push(sensor1Delta);
-          sensor2Changes.push(sensor2Delta);
-    }
-    // Update IMU state separately
-    setImuData(prev => ({
-      imu1_changes: [...prev.imu1_changes, ...sensor1Changes].slice(-maxHistory),
-      imu2_changes: [...prev.imu2_changes, ...sensor2Changes].slice(-maxHistory)
-    }));
+        // Calculate change (delta) from idle value
+        const sensor1Delta = Math.abs(sensor1Value - IDLE_VALUE);
+        const sensor2Delta = Math.abs(sensor2Value - IDLE_VALUE);
 
+        // Assign a timestamp for each sample so ordering within a notification is preserved.
+        // Newest sample gets `now`, previous samples get earlier timestamps spaced by SAMPLE_INTERVAL_MS.
+        const ts = now - (numPairs - 1 - pairIndex) * SAMPLE_INTERVAL_MS;
+
+        sensor1Changes.push({ value: sensor1Delta, ts });
+        sensor2Changes.push({ value: sensor2Delta, ts });
+      }
+
+      // Update IMU state separately and keep only up to maxHistory
+      setImuData(prev => ({
+        imu1_changes: [...prev.imu1_changes, ...sensor1Changes].slice(-maxHistory),
+        imu2_changes: [...prev.imu2_changes, ...sensor2Changes].slice(-maxHistory)
+      }));
     } catch (error) {
       console.error("❌ Error processing IMU data:", error);
     }
-      
   };
 
   const handleIncomingData = (event: any) => {
@@ -490,8 +504,9 @@ export const BluetoothProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         await sendCommand("e", I_k, newPair[0], newPair[1], 1, 0);
         await new Promise((res) => setTimeout(res, 700));
 
-        const imu1 = imuDataRef.current.imu1_changes;
-        const imu2 = imuDataRef.current.imu2_changes;
+  // Convert timed samples to numeric arrays for analysis
+  const imu1 = imuDataRef.current.imu1_changes.map(s => s.value);
+  const imu2 = imuDataRef.current.imu2_changes.map(s => s.value);
 
         // Discard the first 3 readings after stimulation
         const cleanedIMU1 = imu1.slice(-12).slice(4);
@@ -560,12 +575,13 @@ export const BluetoothProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         //const energyIMU2 = extractD3D2Energy(recentIMU2);
         //const newActivation = Math.max(energyIMU1, energyIMU2);
         
-        const imu1 = imuDataRef.current.imu1_changes;
-        const imu2 = imuDataRef.current.imu2_changes;
+  // Convert timed samples to numeric arrays for analysis
+  const imu1 = imuDataRef.current.imu1_changes.map(s => s.value);
+  const imu2 = imuDataRef.current.imu2_changes.map(s => s.value);
 
-        // Discard the first 3 readings after stimulation
-        const cleanedIMU1 = imu1.slice(-12).slice(3);
-        const cleanedIMU2 = imu2.slice(-12).slice(3);
+  // Discard the first 3 readings after stimulation
+  const cleanedIMU1 = imu1.slice(-12).slice(3);
+  const cleanedIMU2 = imu2.slice(-12).slice(3);
 
         const energy = Math.max(
           extractD3D2Energy(cleanedIMU1),
@@ -629,6 +645,11 @@ export const BluetoothProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         await stopStimulation();
     }; 
 
+    // Clear the stored IMU buffers (used by the UI to discard buffered samples when starting a new session)
+    const clearIMU = () => {
+      setImuData({ imu1_changes: [], imu2_changes: [] });
+    };
+
   return (
     <BluetoothContext.Provider value={{
       connect,
@@ -639,6 +660,7 @@ export const BluetoothProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       runOptimizationLoop,
       stopOptimizationLoop,
       imuData,
+      clearIMU,
       startIMU,
       stopIMU,
       isOptimizationRunning, 

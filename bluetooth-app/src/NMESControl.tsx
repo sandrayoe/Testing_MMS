@@ -1,256 +1,214 @@
-import React, { useState, useEffect, useRef } from 'react'
-import { useBluetooth } from './BluetoothContext'
-import BluetoothControl from './BluetoothControl'
-import styles from './NMESControlPanel.module.css'
-import { LineChart, Line, CartesianGrid, XAxis, YAxis, Tooltip, Legend, ResponsiveContainer } from 'recharts'
+import React, { useState, useEffect, useRef } from "react";
+import { useBluetooth } from "./BluetoothContext";
+import BluetoothControl from "./BluetoothControl";
+import styles from "./NMESControlPanel.module.css";
+import { ResponsiveContainer, LineChart, Line, CartesianGrid, XAxis, YAxis, Tooltip, Legend } from "recharts";
 
 const NMESControlPanel: React.FC = () => {
-  const {
-    isConnected,
-    imuData,
-    startIMU,
-    stopIMU,
-    initializeDevice,
-    sendCommand,
-    stopStimulation
-  } = useBluetooth()
+  const { isConnected, imuData, startIMU, stopIMU, clearIMU } = useBluetooth();
 
-  const [sensor1Data, setSensor1Data] = useState<{ time: number; sensorValue: number }[]>([])
-  const [sensor2Data, setSensor2Data] = useState<{ time: number; sensorValue: number }[]>([])
+  const [sensor1Data, setSensor1Data] = useState<{ time: number; sensorValue: number }[]>([]);
+  const [sensor2Data, setSensor2Data] = useState<{ time: number; sensorValue: number }[]>([]);
+  const CHART_WINDOW_SIZE = 200;
+  const CHART_Y_MAX = 250;
 
-  const [isMeasuring, setIsMeasuring] = useState(false)
-  const [isInitializing, setIsInitializing] = useState(false)
+  const [isMeasuring, setIsMeasuring] = useState(false);
+  const prevImuLenRef = useRef({ s1: 0, s2: 0 });
+  const sampleIndexRef = useRef<number>(0);
+  const sessionStartRef = useRef<number | null>(null);
 
-  // Stimulation control state
-  const [electrodeA, setElectrodeA] = useState<number>(1)
-  const [electrodeB, setElectrodeB] = useState<number>(2)
-  const [current, setCurrent] = useState<number>(20)
-  const [isStimulating, setIsStimulating] = useState<boolean>(false)
-  const [lastPair, setLastPair] = useState<[number, number] | null>(null)
-  const [lastCurrent, setLastCurrent] = useState<number | null>(null)
+  const queuedS1Ref = useRef<{ time: number; sensorValue: number }[]>([]);
+  const queuedS2Ref = useRef<{ time: number; sensorValue: number }[]>([]);
+  const flushingRef = useRef(false);
+  const FLUSH_PER_FRAME = 8;
 
-  // Optimization-related state removed
+  const EPS_SEC = 0.0005;
+  const clampAppend = (prevArr: { time: number; sensorValue: number }[], newPts: { time: number; sensorValue: number }[]) => {
+    if (!newPts || newPts.length === 0) return prevArr.slice(-CHART_WINDOW_SIZE);
+    const out: { time: number; sensorValue: number }[] = [];
+    let lastTime = prevArr.length ? prevArr[prevArr.length - 1].time : -Infinity;
+    for (const p of newPts) {
+      const copy = { ...p };
+      if (!(copy.time > lastTime)) {
+        copy.time = lastTime + EPS_SEC;
+      }
+      lastTime = copy.time;
+      out.push(copy);
+    }
+    return [...prevArr, ...out].slice(-CHART_WINDOW_SIZE);
+  };
 
-  const sampleCountRef = useRef(0)
+  // No parameter inputs: sensor control only exposes Start/Stop
+
+  // Keep local ref of imuData for polling
+  const imuDataRefLocal = useRef(imuData);
+  useEffect(() => {
+    imuDataRefLocal.current = imuData;
+  }, [imuData]);
+
+  // Poll and batch append to UI queues
+  useEffect(() => {
+    if (!isConnected || !isMeasuring) return;
+    const sampleIntervalMs = 20;
+    const BIN_MS = 0;
+
+    const tick = () => {
+      const tickNow = performance.now();
+      const s1 = imuDataRefLocal.current.imu1_changes;
+      const s2 = imuDataRefLocal.current.imu2_changes;
+
+      let prevS1 = prevImuLenRef.current.s1;
+      let prevS2 = prevImuLenRef.current.s2;
+      if (s1.length < prevS1) prevS1 = 0;
+      if (s2.length < prevS2) prevS2 = 0;
+
+      const newS1 = s1.length > prevS1 ? s1.slice(prevS1) : [];
+      const newS2 = s2.length > prevS2 ? s2.slice(prevS2) : [];
+      if (newS1.length === 0 && newS2.length === 0) return;
+
+      const getMinMaxTs = (arr1: any[], arr2: any[]) => {
+        const all: number[] = [];
+        if (arr1 && arr1.length) all.push(...arr1.map((s) => s.ts));
+        if (arr2 && arr2.length) all.push(...arr2.map((s) => s.ts));
+        if (all.length === 0) return { minTs: null as number | null, maxTs: null as number | null };
+        return { minTs: Math.min(...all), maxTs: Math.max(...all) };
+      };
+
+      const { minTs } = getMinMaxTs(newS1 as any[], newS2 as any[]);
+      if (minTs !== null && sessionStartRef.current === null) sessionStartRef.current = minTs;
+
+      const pushWithTs = (samples: any[]) => {
+        if (samples.length === 0) return [];
+        const sessionStart = sessionStartRef.current ?? minTs ?? tickNow;
+        return samples.map((s) => ({ time: (s.ts - (sessionStart as number)) / 1000, sensorValue: s.value }));
+      };
+
+      const toAppend1 = pushWithTs(newS1 as any[]);
+      const toAppend2 = pushWithTs(newS2 as any[]);
+
+      if (toAppend1.length) queuedS1Ref.current.push(...toAppend1.map((p) => ({ time: p.time, sensorValue: p.sensorValue })));
+      if (toAppend2.length) queuedS2Ref.current.push(...toAppend2.map((p) => ({ time: p.time, sensorValue: p.sensorValue })));
+
+      if (!flushingRef.current) {
+        flushingRef.current = true;
+        const flush = () => {
+          let didWork = false;
+          if (queuedS1Ref.current.length) {
+            const chunk = queuedS1Ref.current.splice(0, FLUSH_PER_FRAME);
+            setSensor1Data((prev) => clampAppend(prev, chunk));
+            didWork = true;
+          }
+          if (queuedS2Ref.current.length) {
+            const chunk = queuedS2Ref.current.splice(0, FLUSH_PER_FRAME);
+            setSensor2Data((prev) => clampAppend(prev, chunk));
+            didWork = true;
+          }
+          if (didWork) requestAnimationFrame(flush);
+          else flushingRef.current = false;
+        };
+        requestAnimationFrame(flush);
+      }
+
+      prevImuLenRef.current.s1 = s1.length;
+      prevImuLenRef.current.s2 = s2.length;
+      sampleIndexRef.current += Math.max(toAppend1.length, toAppend2.length);
+    };
+
+    const id = setInterval(tick, 100);
+    return () => clearInterval(id);
+  }, [isConnected, isMeasuring]);
 
   useEffect(() => {
-    if (isConnected && isMeasuring) {
-      const interval = setInterval(() => {
-        sampleCountRef.current++
-
-        let rawSensor1 = imuData.imu1_changes.length > 0 ? imuData.imu1_changes[imuData.imu1_changes.length - 1] : 0
-        let rawSensor2 = imuData.imu2_changes.length > 0 ? imuData.imu2_changes[imuData.imu2_changes.length - 1] : 0
-
-        setSensor1Data((prevData) => [
-          ...prevData.slice(-99),
-          { time: sampleCountRef.current, sensorValue: rawSensor1 }
-        ])
-
-        setSensor2Data((prevData) => [
-          ...prevData.slice(-99),
-          { time: sampleCountRef.current, sensorValue: rawSensor2 }
-        ])
-
-      }, 100)
-
-      return () => clearInterval(interval)
+    if (!isConnected) {
+      setIsMeasuring(false);
+      setSensor1Data([]);
+      setSensor2Data([]);
+      prevImuLenRef.current = { s1: 0, s2: 0 };
+      sampleIndexRef.current = 0;
     }
-  }, [isConnected, isMeasuring, imuData])
-
-
-  const handleInitialize = async () => {
-    setIsInitializing(true)
-    try {
-      await initializeDevice()
-      console.log('✅ Device initialization complete.')
-    } catch (error) {
-      console.error('❌ Device initialization failed:', error)
-    }
-    setIsInitializing(false)
-  }
-
-  // Optimization start/stop handlers removed
+  }, [isConnected]);
 
   const handleStartIMU = () => {
-    setIsMeasuring(true)
-    startIMU()
-  }
+    setSensor1Data([]);
+    setSensor2Data([]);
+    clearIMU();
+    prevImuLenRef.current = { s1: 0, s2: 0 };
+    sampleIndexRef.current = 0;
+    sessionStartRef.current = null;
+    setIsMeasuring(true);
+    startIMU();
+  };
 
   const handleStopIMU = () => {
-    setIsMeasuring(false)
-    stopIMU()
-  }
-
-  const handleStimulate = async () => {
-    if (electrodeA === electrodeB) {
-      console.warn('Select two different electrodes')
-      return
-    }
-
-    try {
-      setIsStimulating(true)
-      setLastPair([electrodeA, electrodeB])
-      setLastCurrent(current)
-      // Send stimulation command: 'e' followed by current and electrode numbers (matches provider implementation)
-      await sendCommand('e', current, electrodeA, electrodeB, 1, 0)
-      console.log('✅ Stimulation command sent')
-    } catch (error) {
-      console.error('❌ Failed to send stimulation command', error)
-      setIsStimulating(false)
-    }
-  }
-
-  const handleStopStimulate = async () => {
-    try {
-      await stopStimulation()
-      console.log('🔴 Stop stimulation sent')
-    } catch (error) {
-      console.error('❌ Failed to stop stimulation', error)
-    } finally {
-      setIsStimulating(false)
-    }
-  }
+    setIsMeasuring(false);
+    stopIMU();
+  };
 
   return (
     <div className={styles.container}>
       <div className={styles.header}>
         <img src="/mms_logo_2.png" className={styles.logo} />
-  <h1 className={styles.heading}>MMS - NMES Control (Frontend Demo)</h1>
+        <h1 className={styles.heading}>MMS - Sensor Readings</h1>
       </div>
 
+      <div style={{ height: 8 }} />
       <div className={styles.topContainer}>
-        <div className={styles.buttonContainer}>
-          <BluetoothControl />
+        <div className={styles.controlCard}>
+          <h3>Bluetooth</h3>
+          <div className={styles.buttonContainer}>
+            <BluetoothControl />
+          </div>
         </div>
 
         {isConnected && (
-          <div className={styles.controlBox}>
-            <h2>Stimulation & Sensor Control</h2>
+          <>
+            <div className={styles.controlBox}>
+              <h3>Sensor Control</h3>
+              {/* Parameter inputs removed — only Start/Stop sensor controls remain */}
 
-            <div className={styles.inputGroup}>
-              <label>
-                Electrode A:
-                <select
-                  value={String(electrodeA)}
-                  onChange={(e) => setElectrodeA(Number(e.target.value))}
-                  className={styles.select}
-                >
-                  {[1,2,3,4,5,6].map((n) => (
-                    <option key={n} value={n}>{n}</option>
-                  ))}
-                </select>
-              </label>
-
-              <label>
-                Electrode B:
-                <select
-                  value={String(electrodeB)}
-                  onChange={(e) => setElectrodeB(Number(e.target.value))}
-                  className={styles.select}
-                >
-                  {[1,2,3,4,5,6].map((n) => (
-                    <option key={n} value={n}>{n}</option>
-                  ))}
-                </select>
-              </label>
-
-              <label>
-                Current (mA):
-                <input
-                  type="number"
-                  min={0}
-                  max={100}
-                  value={current}
-                  onChange={(e) => setCurrent(Number(e.target.value))}
-                  className={styles.input}
-                />
-              </label>
+              <div className={styles.controlsRow}>
+                <div className={styles.buttonContainer}>
+                  <button className={styles.button} onClick={handleStartIMU} disabled={!isConnected || isMeasuring}>
+                    Start Sensor(s)
+                  </button>
+                  <button className={styles.button} onClick={handleStopIMU} disabled={!isConnected || !isMeasuring}>
+                    Stop Sensor(s)
+                  </button>
+                </div>
+              </div>
             </div>
-
-            <div className={styles.buttonContainer} style={{ marginTop: '15px' }}>
-              <button
-                className={styles.button}
-                onClick={handleInitialize}
-                disabled={!isConnected || isInitializing}
-              >
-                Initialize Device
-              </button>
-            </div>
-
-            <div className={styles.buttonContainer} style={{ marginTop: '10px' }}>
-              <button
-                className={styles.button}
-                onClick={handleStartIMU}
-                disabled={!isConnected || isMeasuring}
-              >
-                Start Sensor
-              </button>
-              <button
-                className={styles.button}
-                onClick={handleStopIMU}
-                disabled={!isConnected || !isMeasuring}
-              >
-                Stop Sensor
-              </button>
-            </div>
-
-            <div className={styles.buttonContainer}>
-              <button
-                className={styles.button}
-                onClick={handleStimulate}
-                disabled={!isConnected || isStimulating || electrodeA === electrodeB}
-              >
-                Stimulate Pair
-              </button>
-              <button
-                className={styles.button}
-                onClick={handleStopStimulate}
-                disabled={!isConnected || !isStimulating}
-              >
-                Stop Stimulation
-              </button>
-            </div>
-
-            <div style={{ marginTop: 10 }}>
-              <strong>Last stimulation:</strong>
-              <div>Pair: {lastPair ? `${lastPair[0]} - ${lastPair[1]}` : '—'}</div>
-              <div>Current: {lastCurrent ?? '—'} mA</div>
-              {isStimulating && <div>Status: Stimulating</div>}
-            </div>
-          </div>
+          </>
         )}
       </div>
 
       {isConnected && (
         <div className={styles.contentContainer}>
           <div className={styles.rightPanel}>
-            <div className={styles.chartContainer}>
-              <h3>Sensor 1 Readings </h3>
-              <div style={{ width: '100%', height: 200 }}>
-                <ResponsiveContainer width="100%" height="100%">
+            <div className={styles.chartsGrid}>
+              <div className={styles.chartContainer}>
+                <h3>Sensor 1 Readings (0-{CHART_Y_MAX})</h3>
+                <ResponsiveContainer width="100%" height={320}>
                   <LineChart data={sensor1Data}>
                     <CartesianGrid strokeDasharray="3 3" />
-                    <XAxis dataKey="time" />
-                    <YAxis domain={[0, 10]} />
-                    <Tooltip />
+                    <XAxis dataKey="time" type="number" domain={["dataMin", "dataMax"]} tickFormatter={(s) => Number(s).toFixed(1)} />
+                    <YAxis domain={[0, CHART_Y_MAX]} tickCount={6} tickFormatter={(v) => String(Math.round(Number(v)))} />
+                    <Tooltip labelFormatter={(label) => `${Number(label).toFixed(2)}s`} formatter={(value) => Number(value).toFixed(2)} />
                     <Legend />
-                    <Line type="monotone" dataKey="sensorValue" stroke="#8884d8" strokeWidth={2} name="Raw Sensor 1" />
+                    <Line type="linear" dataKey="sensorValue" stroke="#8884d8" strokeWidth={2} name="Sensor 1" dot={false} isAnimationActive={false} />
                   </LineChart>
                 </ResponsiveContainer>
               </div>
-            </div>
 
-            <div className={styles.chartContainer}>
-              <h3>Sensor 2 Readings </h3>
-              <div style={{ width: '100%', height: 200 }}>
-                <ResponsiveContainer width="100%" height="100%">
+              <div className={styles.chartContainer}>
+                <h3>Sensor 2 Readings (0-{CHART_Y_MAX})</h3>
+                <ResponsiveContainer width="100%" height={320}>
                   <LineChart data={sensor2Data}>
                     <CartesianGrid strokeDasharray="3 3" />
-                    <XAxis dataKey="time" />
-                    <YAxis domain={[0, 10]} />
-                    <Tooltip />
+                    <XAxis dataKey="time" type="number" domain={["dataMin", "dataMax"]} tickFormatter={(s) => Number(s).toFixed(1)} />
+                    <YAxis domain={[0, CHART_Y_MAX]} tickCount={6} tickFormatter={(v) => String(Math.round(Number(v)))} />
+                    <Tooltip labelFormatter={(label) => `${Number(label).toFixed(2)}s`} formatter={(value) => Number(value).toFixed(2)} />
                     <Legend />
-                    <Line type="monotone" dataKey="sensorValue" stroke="#82ca9d" strokeWidth={2} name="Raw Sensor 2" />
+                    <Line type="linear" dataKey="sensorValue" stroke="#82ca9d" strokeWidth={2} name="Sensor 2" dot={false} isAnimationActive={false} />
                   </LineChart>
                 </ResponsiveContainer>
               </div>
@@ -259,7 +217,7 @@ const NMESControlPanel: React.FC = () => {
         </div>
       )}
     </div>
-  )
-}
+  );
+};
 
-export default NMESControlPanel
+export default NMESControlPanel;
