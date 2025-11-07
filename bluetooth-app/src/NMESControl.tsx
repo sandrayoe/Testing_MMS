@@ -13,14 +13,19 @@ const NMESControlPanel: React.FC = () => {
   const CHART_Y_MAX = 250;
 
   const [isMeasuring, setIsMeasuring] = useState(false);
-  const prevImuLenRef = useRef({ s1: 0, s2: 0 });
+  // Track last processed timestamps per sensor to survive provider-side pruning
+  const lastSeenTsRef = useRef<{ s1: number | null; s2: number | null }>({ s1: null, s2: null });
   const sampleIndexRef = useRef<number>(0);
   const sessionStartRef = useRef<number | null>(null);
 
   const queuedS1Ref = useRef<{ time: number; sensorValue: number }[]>([]);
   const queuedS2Ref = useRef<{ time: number; sensorValue: number }[]>([]);
   const flushingRef = useRef(false);
-  const FLUSH_PER_FRAME = 8;
+  // Raw-hash dedupe window map (rawHash -> lastSeenMs)
+  const rawHashSeenRef = useRef<Map<string, number>>(new Map());
+  const DUP_WINDOW_MS = 250; // if same raw-hash seen within this window, skip
+  const BASE_FLUSH = 8; // minimum points to flush per frame
+  const MAX_FLUSH = 256; // hard upper bound to avoid giant frames
 
   const EPS_SEC = 0.0005;
   const clampAppend = (prevArr: { time: number; sensorValue: number }[], newPts: { time: number; sensorValue: number }[]) => {
@@ -48,7 +53,7 @@ const NMESControlPanel: React.FC = () => {
 
   // Poll and batch append to UI queues
   useEffect(() => {
-    if (!isConnected || !isMeasuring) return;
+  if (!isConnected || !isMeasuring) return;
     const sampleIntervalMs = 20;
     const BIN_MS = 0;
 
@@ -57,13 +62,14 @@ const NMESControlPanel: React.FC = () => {
       const s1 = imuDataRefLocal.current.imu1_changes;
       const s2 = imuDataRefLocal.current.imu2_changes;
 
-      let prevS1 = prevImuLenRef.current.s1;
-      let prevS2 = prevImuLenRef.current.s2;
-      if (s1.length < prevS1) prevS1 = 0;
-      if (s2.length < prevS2) prevS2 = 0;
+  // Use last-processed timestamps so pruning on the provider won't cause
+  // index-based replays or gaps. This handles the case where the provider
+  // replaces arrays (prunes older samples) and their lengths shrink.
+  const last1 = lastSeenTsRef.current.s1 ?? -Infinity;
+  const last2 = lastSeenTsRef.current.s2 ?? -Infinity;
 
-      const newS1 = s1.length > prevS1 ? s1.slice(prevS1) : [];
-      const newS2 = s2.length > prevS2 ? s2.slice(prevS2) : [];
+  const newS1 = s1.length ? s1.filter((x) => x.ts > last1) : [];
+  const newS2 = s2.length ? s2.filter((x) => x.ts > last2) : [];
       if (newS1.length === 0 && newS2.length === 0) return;
 
       const getMinMaxTs = (arr1: any[], arr2: any[]) => {
@@ -77,30 +83,121 @@ const NMESControlPanel: React.FC = () => {
       const { minTs } = getMinMaxTs(newS1 as any[], newS2 as any[]);
       if (minTs !== null && sessionStartRef.current === null) sessionStartRef.current = minTs;
 
+      // RAW-WINDOW DEBOUNCE (stage 1)
+      try {
+        const raw1s = newS1.map((s: any) => String(s.value));
+        const raw2s = newS2.map((s: any) => String(s.value));
+        const rawHash = raw1s.join(",") + "|" + raw2s.join(",");
+        const lastSeen = rawHashSeenRef.current.get(rawHash) ?? 0;
+        if (tickNow - lastSeen <= DUP_WINDOW_MS) {
+          // skip this notification entirely as a duplicate
+          return;
+        }
+        // record last seen and also purge old entries occasionally
+        rawHashSeenRef.current.set(rawHash, tickNow);
+        // purge entries older than DUP_WINDOW_MS*4 to keep map small
+        if (rawHashSeenRef.current.size > 256) {
+          const cutoff = tickNow - DUP_WINDOW_MS * 4;
+          rawHashSeenRef.current.forEach((v, k) => {
+            if (v < cutoff) rawHashSeenRef.current.delete(k);
+          });
+        }
+      } catch (e) {
+        // non-fatal: if hashing fails, continue processing normally
+      }
+
+      // Remove consecutive duplicate samples (same ts and same value)
+      const dedupeSamples = (samples: { ts: number; value: number }[]) => {
+        const out: typeof samples = [];
+        let lastTs: number | null = null;
+        let lastVal: number | null = null;
+        for (const s of samples) {
+          if (lastTs !== null && s.ts === lastTs && s.value === lastVal) continue;
+          out.push(s);
+          lastTs = s.ts;
+          lastVal = s.value;
+        }
+        return out;
+      };
+
       const pushWithTs = (samples: any[]) => {
         if (samples.length === 0) return [];
         const sessionStart = sessionStartRef.current ?? minTs ?? tickNow;
-        return samples.map((s) => ({ time: (s.ts - (sessionStart as number)) / 1000, sensorValue: s.value }));
+        const deduped = dedupeSamples(samples as { ts: number; value: number }[]);
+        return deduped.map((s) => ({ time: (s.ts - (sessionStart as number)) / 1000, sensorValue: s.value }));
       };
 
       const toAppend1 = pushWithTs(newS1 as any[]);
       const toAppend2 = pushWithTs(newS2 as any[]);
 
-      if (toAppend1.length) queuedS1Ref.current.push(...toAppend1.map((p) => ({ time: p.time, sensorValue: p.sensorValue })));
-      if (toAppend2.length) queuedS2Ref.current.push(...toAppend2.map((p) => ({ time: p.time, sensorValue: p.sensorValue })));
+      const appendUniqueToQueue = (queueRef: React.MutableRefObject<{ time: number; sensorValue: number }[]>, pts: { time: number; sensorValue: number }[]) => {
+        if (!pts || pts.length === 0) return;
+        for (const p of pts) {
+          const lastQueued = queueRef.current.length ? queueRef.current[queueRef.current.length - 1] : null;
+          if (lastQueued) {
+            const lastMs = Math.round(lastQueued.time * 1000);
+            const pMs = Math.round(p.time * 1000);
+            if (lastMs === pMs && lastQueued.sensorValue === p.sensorValue) continue;
+          }
+          queueRef.current.push(p);
+        }
+      };
 
-      if (!flushingRef.current) {
+      if (toAppend1.length) appendUniqueToQueue(queuedS1Ref, toAppend1.map((p) => ({ time: p.time, sensorValue: p.sensorValue })));
+      if (toAppend2.length) appendUniqueToQueue(queuedS2Ref, toAppend2.map((p) => ({ time: p.time, sensorValue: p.sensorValue })));
+
+  if (!flushingRef.current) {
         flushingRef.current = true;
         const flush = () => {
           let didWork = false;
           if (queuedS1Ref.current.length) {
-            const chunk = queuedS1Ref.current.splice(0, FLUSH_PER_FRAME);
-            setSensor1Data((prev) => clampAppend(prev, chunk));
+            const take = Math.min(MAX_FLUSH, Math.max(BASE_FLUSH, Math.ceil(queuedS1Ref.current.length / 4)));
+            let chunk = queuedS1Ref.current.splice(0, take);
+            // TAIL-PAIR DEDUPE (stage 2): avoid appending a chunk whose first point
+            // is identical to the previous last point shown in state
+            setSensor1Data((prev) => {
+              if (!chunk || chunk.length === 0) return prev;
+              const lastPrev = prev.length ? prev[prev.length - 1] : null;
+              if (lastPrev) {
+                const firstChunk = chunk[0];
+                const lastMs = Math.round(lastPrev.time * 1000);
+                const firstMs = Math.round(firstChunk.time * 1000);
+                if (lastMs === firstMs && lastPrev.sensorValue === firstChunk.sensorValue) {
+                  // drop the leading identical sample
+                  chunk = chunk.slice(1);
+                }
+              }
+              if (!chunk || chunk.length === 0) return prev;
+              // update last seen ts for sensor1 using absolute timestamps
+              const sessionStart = sessionStartRef.current ?? 0;
+              const maxRel = Math.max(...chunk.map((c) => c.time * 1000)); // ms since sessionStart
+              const maxAbs = sessionStart + maxRel; // absolute ms timestamp
+              lastSeenTsRef.current.s1 = Math.max(lastSeenTsRef.current.s1 ?? -Infinity, maxAbs);
+              return clampAppend(prev, chunk);
+            });
             didWork = true;
           }
           if (queuedS2Ref.current.length) {
-            const chunk = queuedS2Ref.current.splice(0, FLUSH_PER_FRAME);
-            setSensor2Data((prev) => clampAppend(prev, chunk));
+            const take = Math.min(MAX_FLUSH, Math.max(BASE_FLUSH, Math.ceil(queuedS2Ref.current.length / 4)));
+            let chunk = queuedS2Ref.current.splice(0, take);
+            setSensor2Data((prev) => {
+              if (!chunk || chunk.length === 0) return prev;
+              const lastPrev = prev.length ? prev[prev.length - 1] : null;
+              if (lastPrev) {
+                const firstChunk = chunk[0];
+                const lastMs = Math.round(lastPrev.time * 1000);
+                const firstMs = Math.round(firstChunk.time * 1000);
+                if (lastMs === firstMs && lastPrev.sensorValue === firstChunk.sensorValue) {
+                  chunk = chunk.slice(1);
+                }
+              }
+              if (!chunk || chunk.length === 0) return prev;
+              const sessionStart = sessionStartRef.current ?? 0;
+              const maxRel = Math.max(...chunk.map((c) => c.time * 1000));
+              const maxAbs = sessionStart + maxRel;
+              lastSeenTsRef.current.s2 = Math.max(lastSeenTsRef.current.s2 ?? -Infinity, maxAbs);
+              return clampAppend(prev, chunk);
+            });
             didWork = true;
           }
           if (didWork) requestAnimationFrame(flush);
@@ -109,12 +206,11 @@ const NMESControlPanel: React.FC = () => {
         requestAnimationFrame(flush);
       }
 
-      prevImuLenRef.current.s1 = s1.length;
-      prevImuLenRef.current.s2 = s2.length;
+      // no index-based pointers to update (we track last-seen timestamps)
       sampleIndexRef.current += Math.max(toAppend1.length, toAppend2.length);
     };
 
-    const id = setInterval(tick, 100);
+  const id = setInterval(tick, 50);
     return () => clearInterval(id);
   }, [isConnected, isMeasuring]);
 
@@ -123,7 +219,7 @@ const NMESControlPanel: React.FC = () => {
       setIsMeasuring(false);
       setSensor1Data([]);
       setSensor2Data([]);
-      prevImuLenRef.current = { s1: 0, s2: 0 };
+      lastSeenTsRef.current = { s1: null, s2: null };
       sampleIndexRef.current = 0;
     }
   }, [isConnected]);
@@ -132,7 +228,7 @@ const NMESControlPanel: React.FC = () => {
     setSensor1Data([]);
     setSensor2Data([]);
     clearIMU();
-    prevImuLenRef.current = { s1: 0, s2: 0 };
+    lastSeenTsRef.current = { s1: null, s2: null };
     sampleIndexRef.current = 0;
     sessionStartRef.current = null;
     setIsMeasuring(true);

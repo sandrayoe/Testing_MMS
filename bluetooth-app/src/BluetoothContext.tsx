@@ -39,6 +39,14 @@ export const BluetoothProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   const deviceRef = useRef<BluetoothDevice | null>(null);
   const isManualDisconnectRef = useRef(false);
 
+  // Track whether we've attached the TX notification listener to avoid duplicates
+  const txListenerActiveRef = useRef(false);
+  // Track the timestamp of the last incoming notification (ms)
+  const lastReceivedTsRef = useRef<number | null>(null);
+  // Notification counter for simple diagnostics
+  const notifCountRef = useRef(0);
+  const VERBOSE_IMU_LOG = false; // set true to log every packet (may be noisy)
+
   const isInitializingRef = useRef<boolean>(false);
 
   const isOptimizationRunningRef = useRef(false); 
@@ -88,8 +96,13 @@ export const BluetoothProvider: React.FC<{ children: React.ReactNode }> = ({ chi
           console.error("❌ TX characteristic not found! Check UUID.");
       } else {
           console.log("✅ TX Characteristic Found. Starting notifications...");
-          await txChar.startNotifications();
-          txChar.addEventListener("characteristicvaluechanged", handleIncomingData);
+          try {
+            await txChar.startNotifications();
+          } catch (e) {
+            // ignore - some platforms auto-enable notifications when listener attached
+          }
+          try { txChar.addEventListener("characteristicvaluechanged", handleIncomingData); } catch (e) {}
+          txListenerActiveRef.current = true;
       }
 
       setRxCharacteristic(rxChar || null);
@@ -111,6 +124,15 @@ export const BluetoothProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       deviceRef.current.removeEventListener("gattserverdisconnected", handleDisconnection);
 
       if (deviceRef.current.gatt?.connected) {
+        // try to stop notifications and remove listener first
+        try {
+          if (txCharacteristic) {
+            try { txCharacteristic.removeEventListener("characteristicvaluechanged", handleIncomingData); } catch (e) {}
+            try { await txCharacteristic.stopNotifications(); } catch (e) {}
+            txListenerActiveRef.current = false;
+          }
+        } catch (e) {}
+
         deviceRef.current.gatt.disconnect();
         console.log("🔌 Device disconnected manually");
       }
@@ -143,11 +165,15 @@ export const BluetoothProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   };
 
   const maxHistory = 500; // max history for the IMU data
+  // Prefer time-based retention: keep samples for HISTORY_MS milliseconds
+  const HISTORY_MS = 60_000; // keep last 60s by default
+  // (No in-memory archival) older samples are dropped to keep memory bounded while streaming.
 
   const handleIMUData = (rawBytes: Uint8Array) => {
     try {
       const now = performance.now();
-      const dataView = new DataView(rawBytes.buffer);
+      // Create DataView using byteOffset/byteLength in case the Uint8Array is a view
+      const dataView = new DataView(rawBytes.buffer, rawBytes.byteOffset, rawBytes.byteLength);
       const sensor1Changes: TimedSample[] = [];
       const sensor2Changes: TimedSample[] = [];
 
@@ -171,11 +197,23 @@ export const BluetoothProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         sensor2Changes.push({ value: sensor2Delta, ts });
       }
 
-      // Update IMU state separately and keep only up to maxHistory
-      setImuData(prev => ({
-        imu1_changes: [...prev.imu1_changes, ...sensor1Changes].slice(-maxHistory),
-        imu2_changes: [...prev.imu2_changes, ...sensor2Changes].slice(-maxHistory)
-      }));
+      // Update IMU state using time-based retention (keep last HISTORY_MS)
+      const cutoff = now - HISTORY_MS;
+      setImuData(prev => {
+        const a1 = prev.imu1_changes.filter(s => s.ts >= cutoff);
+        const a2 = prev.imu2_changes.filter(s => s.ts >= cutoff);
+
+        // Older samples are dropped here (no archival) to avoid growing memory.
+
+        const merged1 = [...a1, ...sensor1Changes];
+        const merged2 = [...a2, ...sensor2Changes];
+        // Safety hard cap: avoid unbounded growth even if HISTORY_MS large
+        const HARD_CAP = 50_000;
+        return {
+          imu1_changes: merged1.length > HARD_CAP ? merged1.slice(-HARD_CAP) : merged1,
+          imu2_changes: merged2.length > HARD_CAP ? merged2.slice(-HARD_CAP) : merged2,
+        };
+      });
     } catch (error) {
       console.error("❌ Error processing IMU data:", error);
     }
@@ -187,8 +225,18 @@ export const BluetoothProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         console.warn("⚠️ Received event without a valid value.");
         return;
     }
-    const value = target.value;
-    const rawBytes = new Uint8Array(value.buffer);
+    const value = target.value as DataView;
+    // Use byteOffset/byteLength to construct a precise Uint8Array view
+    const rawBytes = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+    // update last received timestamp for watchdog
+    try { 
+      const now = performance.now();
+      lastReceivedTsRef.current = now; 
+      notifCountRef.current += 1;
+      if (VERBOSE_IMU_LOG || (notifCountRef.current % 50) === 0) {
+        console.log(`📩 IMU packet #${notifCountRef.current} len=${rawBytes.length} ts=${Math.round(now)}`);
+      }
+    } catch (e) {}
     //console.log("📩 Incoming BLE data:", new TextDecoder().decode(event.target.value.buffer));
 
     if (isInitializingRef.current) {
@@ -200,6 +248,29 @@ export const BluetoothProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     handleIMUData(rawBytes);
   };
 
+  // Watchdog: if no notifications arrive for STALE_MS while we believe we are listening,
+  // attempt to restart notifications. This helps recover from platform/BLE stack drops.
+  useEffect(() => {
+    const STALE_MS = 2000;
+    const id = setInterval(() => {
+      try {
+        if (!txCharacteristic || !isConnected) return;
+        const last = lastReceivedTsRef.current;
+        if (txListenerActiveRef.current && last && (performance.now() - last) > STALE_MS) {
+          console.warn("No IMU notifications received for", Math.round(performance.now() - last), "ms — attempting to restart notifications (watchdog)");
+          try { txCharacteristic.removeEventListener("characteristicvaluechanged", handleIncomingData); } catch (e) {}
+          try { txCharacteristic.startNotifications(); } catch (e) {}
+          try { txCharacteristic.addEventListener("characteristicvaluechanged", handleIncomingData); } catch (e) {}
+          txListenerActiveRef.current = true;
+          lastReceivedTsRef.current = performance.now();
+        }
+      } catch (e) {
+        // swallow watchdog errors
+      }
+    }, 1000);
+    return () => clearInterval(id);
+  }, [txCharacteristic, isConnected]);
+
 
   // Start IMU data streaming
   const startIMU = async () => {
@@ -210,10 +281,22 @@ export const BluetoothProvider: React.FC<{ children: React.ReactNode }> = ({ chi
           return;
       }
 
+      // Clear any buffered IMU state so UI starts from the tail when user starts streaming
+      try { clearIMU(); } catch (e) {}
+
       try {
           await sendCommand("b"); // Start IMU data streaming from the device
-          txCharacteristic.addEventListener("characteristicvaluechanged", handleIncomingData);
-          await txCharacteristic.startNotifications();
+          // Attach listener / notifications only if not already active
+          try {
+            if (!txListenerActiveRef.current) {
+              txCharacteristic.addEventListener("characteristicvaluechanged", handleIncomingData);
+              await txCharacteristic.startNotifications();
+              txListenerActiveRef.current = true;
+            }
+          } catch (e) {
+            // If startNotifications failed, still attempt to add listener (best-effort)
+            try { txCharacteristic.addEventListener("characteristicvaluechanged", handleIncomingData); } catch (ee) {}
+          }
           console.log("✅ Listening for IMU data...");
       } catch (error) {
           console.error("❌ Failed to start IMU:", error);
@@ -228,8 +311,9 @@ export const BluetoothProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
       try {
           await sendCommand("B"); // Stop IMU data streaming from the device
-          txCharacteristic.removeEventListener("characteristicvaluechanged", handleIncomingData);
-          await txCharacteristic.stopNotifications();
+      try { txCharacteristic.removeEventListener("characteristicvaluechanged", handleIncomingData); } catch (e) {}
+      try { await txCharacteristic.stopNotifications(); } catch (e) {}
+      txListenerActiveRef.current = false;
       } catch (error) {
           console.error("❌ Failed to stop IMU:", error);
       }
@@ -660,6 +744,7 @@ export const BluetoothProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       runOptimizationLoop,
       stopOptimizationLoop,
       imuData,
+      // (no archive export/clear - older samples are dropped)
       clearIMU,
       startIMU,
       stopIMU,
