@@ -5,7 +5,7 @@ import styles from "./NMESControlPanel.module.css";
 import { ResponsiveContainer, LineChart, Line, CartesianGrid, XAxis, YAxis, Tooltip, Legend } from "recharts";
 
 const NMESControlPanel: React.FC = () => {
-  const { isConnected, imuData, startIMU, stopIMU, clearIMU } = useBluetooth();
+  const { isConnected, imuData, startIMU, stopIMU, clearIMU, sendCommand, stopStimulation } = useBluetooth();
 
   const [sensor1Data, setSensor1Data] = useState<{ time: number; sensorValue: number }[]>([]);
   const [sensor2Data, setSensor2Data] = useState<{ time: number; sensorValue: number }[]>([]);
@@ -240,6 +240,67 @@ const NMESControlPanel: React.FC = () => {
     stopIMU();
   };
 
+  // Stimulation controls: one input box for electrode pair (e.g. "1,2")
+  const [pairInput, setPairInput] = useState<string>("1,2");
+  const [amplitude, setAmplitude] = useState<number>(20);
+  const DEFAULT_CURRENT = 20; // default fallback mA used when stimulating from UI
+
+  const padValue = (num: number): string => (num < 10 ? "0" + num : num.toString());
+  const encodeElectrode = (n: number): string => {
+    if (n >= 0 && n <= 9) return String(n);
+    // 10 -> 'A' (65), so 55 + n maps 10->65
+    return String.fromCharCode(55 + n);
+  };
+
+  const handleStimulate = async () => {
+    if (!isConnected) return;
+    const txt = pairInput.trim();
+    const parts = txt.split(/\s*,\s*/);
+    if (parts.length < 2) {
+      console.warn("Invalid pair input, expected format 'a,b'");
+      return;
+    }
+    const a = Number(parts[0]);
+    const b = Number(parts[1]);
+    if (!Number.isFinite(a) || !Number.isFinite(b)) {
+      console.warn("Invalid electrode numbers");
+      return;
+    }
+    try {
+      // Build electrode pattern repeated to fill B1-B8 (4 repeats of the pair)
+      const chA = encodeElectrode(a);
+      const chB = encodeElectrode(b);
+      const electrodePattern = `${chA}${chB}${chA}${chB}${chA}${chB}${chA}${chB}`;
+      const ampVal = Number.isFinite(amplitude) ? amplitude : DEFAULT_CURRENT;
+      const ampStr = padValue(Math.max(0, Math.min(120, Math.round(ampVal))));
+      const payload = electrodePattern + ampStr + "1"; // run = '1'
+      // Send uppercase 'E' command followed by payload characters
+      await sendCommand("E", payload);
+      console.log(`E command sent: ${payload}`);
+    } catch (e) {
+      console.error("Failed to send E stimulation command:", e);
+    }
+  };
+
+  const handleStopStim = async () => {
+    if (!isConnected) return;
+    try {
+      const txt = pairInput.trim();
+      const parts = txt.split(/\s*,\s*/);
+      const a = Number(parts[0]);
+      const b = Number(parts[1]);
+      const chA = encodeElectrode(a);
+      const chB = encodeElectrode(b);
+      const electrodePattern = `${chA}${chB}${chA}${chB}${chA}${chB}${chA}${chB}`;
+      const ampStr = padValue(Math.max(0, Math.min(120, Math.round(amplitude))));
+      const payload = electrodePattern + ampStr + "0"; // run = '0' to stop
+      await sendCommand("E", payload);
+      console.log(`E stop sent: ${payload}`);
+    } catch (e) {
+      console.error("Failed to send E stop command:", e);
+    }
+  };
+
   return (
     <div className={styles.container}>
       <div className={styles.header}>
@@ -271,6 +332,19 @@ const NMESControlPanel: React.FC = () => {
                     Stop Sensor(s)
                   </button>
                 </div>
+              </div>
+              <div style={{ height: 8 }} />
+              <div className={styles.controlsRow}>
+                <label style={{ marginRight: 8 }}>Electrode pair:</label>
+                <input value={pairInput} onChange={(e) => setPairInput(e.target.value)} style={{ width: 80, marginRight: 8 }} />
+                <label style={{ marginRight: 8 }}>Current (mA):</label>
+                <input type="number" value={amplitude} onChange={(e) => setAmplitude(Number(e.target.value))} style={{ width: 80, marginRight: 8 }} min={0} max={120} />
+                <button className={styles.button} onClick={handleStimulate} disabled={!isConnected}>
+                  Stimulate
+                </button>
+                <button className={styles.button} onClick={handleStopStim} disabled={!isConnected}>
+                  Stop Stim
+                </button>
               </div>
             </div>
           </>
